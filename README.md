@@ -142,6 +142,64 @@ Parameters allowed:
 - **--environment**: List of sites (drush alias) to be run on Drupal Multisites. The drush alias must be local.
 - **--packages**: Update only the mentioned packages.
   **--limit**: Limit the number of direct packages to update in each drupal-updater run. Ignored when packages is provided.
+- **--check-run**: Resolve and inspect the stepped dependency sequence without
+  installing packages, invoking Drush, or changing the project or Git state.
+
+### Check a run before updating
+
+```bash
+./vendor/bin/drupal-updater --check-run
+```
+
+This standalone check reads the current `composer.json` and `composer.lock`,
+including uncommitted changes. It first resolves an unrestricted full update in
+a private temporary workspace. Independently, it resolves the usual automatically
+selected package updates in order, advancing a second temporary lock after each
+step. `--packages`, `--security`, `--no-dev` and `--limit` control that stepped
+sequence as they do in a normal run; they do not restrict the full target.
+
+The report shows each changed package's versions and source references, its full
+target, and whether the normal updater would invoke `updb` after that step. A
+downgrade, return to an earlier state, dev-to-release replacement, removal or
+same-version reference replacement across an earlier predicted `updb` invocation
+is reported as **potentially unsafe**. A change made before an invocation is
+distinguished from the state that invocation would actually see. The current
+updater's wildcard entries (including its appended `drupal/core*` entry) do not
+produce an exact package-type lookup; the check mirrors that existing behavior.
+
+For example, a core-recommended update might select development core, an unrelated
+module update would invoke `updb` with that core present, and the final grouped
+core update might return to a stable release. The report identifies the relevant
+steps without claiming that any pending database updates actually exist.
+
+Exit codes for `--check-run`:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The check completed with no potentially unsafe backtracking detected. |
+| `1` | The check was incomplete, for example because a resolution failed. |
+| `2` | The check completed and found potentially unsafe backtracking. |
+
+Differences from the full target are informational: untouched packages are not
+counted, and a selected-package or limited run need not reach the full target.
+The target itself can contain prereleases or development versions if the site's
+policy allows them. The check does not change stability policy, pin dependencies,
+regroup updates, or start a real update automatically.
+
+**Limits:** Composer runs with `--no-install --no-plugins --no-scripts`. Project
+plugins, scripts, and post-update processors (including DDQG ignore adjustments)
+are not simulated, so their effects on later resolutions are not predicted.
+Repository metadata can also change between resolutions. This is a diagnostic
+comparison, not an execution plan or a guarantee of database/application safety.
+
+The check requires Composer inputs and repository access, but does not require an
+installed Drupal site or a database. Relative repository paths, project-local
+`auth.json`, inherited Composer authentication, custom `COMPOSER` manifests and
+the root package version are carried into the workspaces. Repository metadata is
+downloaded, and VCS repositories may require metadata clones; package archives
+are not installed. A private temporary cache is used rather than writing to the
+project's cache. Workspaces and authentication copies are removed on success and
+failure. `composerTimeout` applies to discovery and both resolutions.
 
 Examples:
 

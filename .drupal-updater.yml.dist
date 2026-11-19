@@ -5,6 +5,7 @@ noDev: false
 # Set to true to only update securities.
 onlySecurities: false
 # Allows specify which packages will be updated.
+# Use --check-run to inspect the resulting sequence without installing or using Drush.
 packages: []
 # List of environments to update.
 environments: ['@self']

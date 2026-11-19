@@ -3,6 +3,8 @@
 namespace DrupalUpdater;
 
 use Composer\InstalledVersions;
+use DrupalUpdater\CheckRun\CheckRun;
+use DrupalUpdater\CheckRun\Workspace;
 use DrupalUpdater\Config\Config;
 use DrupalUpdater\Config\ConfigInterface;
 use DrupalUpdater\PackageIssue\PackageIssue;
@@ -63,6 +65,23 @@ class UpdaterCommand extends Command {
   protected bool $showFullReport = TRUE;
 
   /**
+   * Whether only dependency resolutions should be checked.
+   */
+  protected bool $checkRun = FALSE;
+
+  /**
+   * Working directory for isolated check commands, otherwise the current one.
+   */
+  protected ?string $commandDirectory = NULL;
+
+  /**
+   * Environment overrides used by isolated Composer checks.
+   *
+   * @var array<string, string>
+   */
+  protected array $checkEnvironment = [];
+
+  /**
    * Package issues of the run, printed at its end.
    */
   protected PackageIssueReport $packageIssues;
@@ -112,6 +131,7 @@ Update includes:
     $this->addOption('packages', 'pl', InputOption::VALUE_OPTIONAL, 'Comma separated list of packages to update');
     $this->addOption('limit', 'l', InputOption::VALUE_OPTIONAL, 'Maximum number of direct packages to update. It must be integer positive, set to 0 for no limit.');
     $this->addOption('consolidate-configuration', 'cc', InputOption::VALUE_NEGATABLE, 'If false, configuration will not be consolidated.');
+    $this->addOption('check-run', NULL, InputOption::VALUE_NONE, 'Check the stepped dependency sequence without installing packages or running Drupal updates.');
   }
 
   /**
@@ -119,6 +139,7 @@ Update includes:
    */
   protected function initialize(InputInterface $input, OutputInterface $output): void {
     $this->output = $output;
+    $this->checkRun = (bool) $input->getOption('check-run');
     $this->setupConfig($input->getOption('config'));
     $this->mapInputToConfiguration($input);
     $this->logConfiguration();
@@ -188,9 +209,14 @@ Update includes:
    */
   protected function logConfiguration(): void {
     $this->printHeader1('SETUP');
-    $this->output->writeln('Drupal web root found at ' . $this->findDrupalWebRoot());
-    $this->output->writeln(sprintf('Environments: %s', implode(', ', $this->getConfiguration()->getEnvironments())));
-    $this->output->writeln(sprintf('GIT author will be overriden with: %s', $this->getConfiguration()->getAuthor()));
+    if ($this->checkRun) {
+      $this->output->writeln('Check run: dependency resolution only; no installation, Drush or Git changes.');
+    }
+    else {
+      $this->output->writeln('Drupal web root found at ' . $this->findDrupalWebRoot());
+      $this->output->writeln(sprintf('Environments: %s', implode(', ', $this->getConfiguration()->getEnvironments())));
+      $this->output->writeln(sprintf('GIT author will be overriden with: %s', $this->getConfiguration()->getAuthor()));
+    }
 
     if ($this->getConfiguration()->onlyUpdateSecurities()) {
       $this->output->writeln('Only security updates will be done');
@@ -217,6 +243,9 @@ Update includes:
    * {@inheritdoc}
    */
   protected function execute(InputInterface $input, OutputInterface $output) : int {
+    if ($this->checkRun) {
+      return $this->runCheck();
+    }
     $this->packageIssues = new PackageIssueReport();
     try {
       return $this->runUpdates();
@@ -243,14 +272,7 @@ Update includes:
     }
 
     $this->printHeader1('2. Checking packages');
-
-    if (!isset($this->packagesToUpdate) || empty($this->packagesToUpdate)) {
-      $this->checkPackages();
-    }
-    else {
-      $this->output->writeln(sprintf('Packages to update:'));
-      $this->output->writeln(implode("\n", $this->packagesToUpdate));
-    }
+    $this->selectPackages();
     $this->output->writeln('');
     $this->printHeader1('3. Updating packages');
     $this->updatePackages($this->packagesToUpdate);
@@ -265,6 +287,62 @@ Update includes:
     $this->cleanup();
 
     return 0;
+  }
+
+  /**
+   * Selects packages in the same order for checks and real updates.
+   */
+  protected function selectPackages(): void {
+    if (!isset($this->packagesToUpdate) || empty($this->packagesToUpdate)) {
+      $this->checkPackages();
+    }
+    else {
+      $this->output->writeln(sprintf('Packages to update:'));
+      $this->output->writeln(implode("\n", $this->packagesToUpdate));
+    }
+  }
+
+  /**
+   * Checks isolated full and stepped resolutions before any normal mutations.
+   */
+  protected function runCheck(): int {
+    $workspace = NULL;
+    try {
+      $source = getcwd();
+      if ($source === FALSE) {
+        throw new \RuntimeException('Cannot determine the project directory.');
+      }
+      $self = json_decode($this->runComposer('show --self --format=json')->getOutput(), TRUE, 512, JSON_THROW_ON_ERROR);
+      $version = $self['versions'][0] ?? NULL;
+      if (!is_string($version)) {
+        throw new \RuntimeException('Cannot determine the Composer root package version.');
+      }
+      $workspace = new Workspace($source, $version);
+      $this->checkEnvironment = $workspace->environment();
+      $this->commandDirectory = $workspace->path('stepped');
+      $this->printHeader1('Checking packages');
+      $this->selectPackages();
+      $check = new CheckRun(
+        $this->output,
+        function (string $arguments, string $directory): void {
+          $this->commandDirectory = $directory;
+          $this->runComposer($arguments);
+        },
+        fn (string $package): bool => $this->isDrupalExtension($package),
+      );
+      return $check->run($workspace, $this->packagesToUpdate, $this->getEffectiveLimit());
+    }
+    catch (\Exception $exception) {
+      $this->output->writeln('Check run incomplete: ' . $exception->getMessage());
+      return 1;
+    }
+    finally {
+      $this->commandDirectory = NULL;
+      $this->checkEnvironment = [];
+      if ($workspace !== NULL) {
+        $workspace->cleanup();
+      }
+    }
   }
 
   /**
@@ -345,7 +423,7 @@ Update includes:
    *   When the command fails.
    */
   protected function runCommand(string $command, int $timeout = self::DEFAULT_TIMEOUT, array $environment = []) {
-    $process = Process::fromShellCommandline($command);
+    $process = Process::fromShellCommandline($command, $this->commandDirectory);
     $process->setTimeout($timeout);
     if ($environment !== []) {
       $process->setEnv($environment);
@@ -373,12 +451,21 @@ Update includes:
    *   Process result.
    */
   protected function runComposer(string $arguments, ?int $limit = NULL) {
+    if ($this->checkRun) {
+      // Insert global flags before any pipeline in a discovery command.
+      $arguments = preg_replace('/^([a-z-]+)\b/', '$1 --no-plugins --no-scripts --no-interaction', $arguments) ?? $arguments;
+    }
     $command = 'composer ' . $arguments;
     if ($limit !== NULL) {
       $command = sprintf('timeout %d %s', $limit, $command);
     }
     $timeout = $this->getConfiguration()->getComposerTimeout();
-    return $this->runCommand($command, $timeout, ['COMPOSER_PROCESS_TIMEOUT' => (string) $timeout]);
+    $environment = ['COMPOSER_PROCESS_TIMEOUT' => (string) $timeout] + $this->checkEnvironment;
+    if ($this->checkRun && $this->commandDirectory !== NULL) {
+      $environment['COMPOSER_VENDOR_DIR'] = $this->commandDirectory . '/vendor';
+      $environment['PWD'] = $this->commandDirectory;
+    }
+    return $this->runCommand($command, $timeout, $environment);
   }
 
   /**
@@ -1158,7 +1245,9 @@ Update includes:
    *   TRUE when the package is a drupal extension.
    */
   protected function isDrupalExtension(string $package) {
-    $package_type = $this->runComposer(sprintf("show %s | grep ^type | awk '{print $3}'", $package))->getOutput();
+    $locked = $this->checkRun ? ' --locked' : '';
+    $argument = $this->checkRun ? escapeshellarg($package) : $package;
+    $package_type = $this->runComposer(sprintf("show%s %s | grep ^type | awk '{print $3}'", $locked, $argument))->getOutput();
     return $package_type != 'drupal-library' && str_starts_with($package_type, 'drupal');
   }
 

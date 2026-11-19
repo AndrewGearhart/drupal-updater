@@ -2,6 +2,8 @@
 
 namespace DrupalUpdater\Tests\Simulator;
 
+use Composer\Semver\Semver;
+
 /**
  * Simulates the Composer commands the updater runs.
  *
@@ -33,6 +35,10 @@ final class ComposerSimulator extends ToolSimulator {
    */
   private function show(Invocation $invocation): int {
     $files = new ComposerFiles($invocation->cwd());
+    if ($invocation->hasOption('--self', '-s')) {
+      $invocation->out((string) json_encode(['name' => $files->rootName(), 'versions' => [$files->rootVersion()]]));
+      return 0;
+    }
     $include_dev = !$invocation->hasOption('--no-dev');
     $positionals = $invocation->positionals(['--format', '-f', '--ignore']);
     if (count($positionals) === 1) {
@@ -66,6 +72,13 @@ final class ComposerSimulator extends ToolSimulator {
    * Simulates "show <package>".
    */
   private function showPackage(Invocation $invocation, ComposerFiles $files, string $name): int {
+    if (str_contains($name, '*')) {
+      $regex = '{^' . str_replace('\\*', '.*', preg_quote($name)) . '$}i';
+      $names = array_filter(array_keys($files->lockedPackages()), fn (string $package) => preg_match($regex, $package) === 1);
+      // Wildcard show output is a list, not a single package's type/details.
+      $invocation->out(ComposerOutput::names(array_values($names)));
+      return 0;
+    }
     $package = $files->lockedPackages()[$name] ?? NULL;
     if ($package === NULL) {
       $invocation->err(sprintf("Package \"%s\" not found, try using --available (-a) to show all available packages.\n", $name));
@@ -203,7 +216,8 @@ final class ComposerSimulator extends ToolSimulator {
     $locked = $files->lockedPackages();
     $invocation->err("Loading composer repositories with package information\n");
     $names = [];
-    foreach ($invocation->positionals() as $pattern) {
+    $patterns = $invocation->positionals();
+    foreach ($patterns as $pattern) {
       // Package arguments accept "*" wildcards, e.g. drupal/core*.
       $regex = '{^' . str_replace('\\*', '.*', preg_quote($pattern)) . '$}i';
       $matches = array_filter(array_keys($locked), fn (string $name) => preg_match($regex, $name) === 1);
@@ -211,6 +225,9 @@ final class ComposerSimulator extends ToolSimulator {
         $invocation->err(sprintf("Package \"%s\" listed for update is not locked.\n", $pattern));
       }
       $names = array_merge($names, $matches);
+    }
+    if ($patterns === []) {
+      $names = array_keys($locked);
     }
     if ($invocation->hasOption('--with-dependencies', '-w', '--with-all-dependencies', '-W')) {
       $names = $this->withRequirements($names, $locked);
@@ -278,9 +295,14 @@ final class ComposerSimulator extends ToolSimulator {
    */
   private function newVersions(Invocation $invocation, array $names, array $locked): array {
     $declared = $invocation->state()->packages();
+    $root = (new ComposerFiles($invocation->cwd()))->rootRequirements();
     $versions = [];
     foreach (array_unique($names) as $name) {
       $latest = isset($declared[$name]) ? $declared[$name]->latest() : NULL;
+      // Respect direct constraints, without attempting dependency resolution.
+      if ($latest !== NULL && isset($root[$name]) && !Semver::satisfies($latest, $root[$name])) {
+        continue;
+      }
       if ($latest !== NULL && $latest !== $locked[$name]['version']) {
         $versions[$name] = $latest;
       }

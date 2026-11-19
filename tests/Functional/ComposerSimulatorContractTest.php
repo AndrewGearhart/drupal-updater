@@ -33,6 +33,12 @@ final class ComposerSimulatorContractTest extends UpdaterTestCase {
     'composer audit --locked --format plain 2>/dev/null',
     'composer install --no-interaction --no-progress --no-scripts',
     'composer audit --locked  --format plain 2>&1 | grep ^Package | cut -f2 -d: | sed "s/^ *//" | sort -u',
+    'composer show --no-plugins --no-scripts --no-interaction --locked --outdated --name-only 2>/dev/null',
+    'composer show --no-plugins --no-scripts --no-interaction --locked --direct --name-only 2>/dev/null',
+    "composer why --no-plugins --no-scripts --no-interaction example/dependency --locked | awk '{print \$1}'",
+    'composer audit --no-plugins --no-scripts --no-interaction --locked --format plain 2>&1 | grep ^Package | cut -f2 -d: | sed "s/^ *//" | sort -u',
+    "composer show --no-plugins --no-scripts --no-interaction --locked drupal/example | grep ^type | awk '{print \$3}'",
+    "composer show --no-plugins --no-scripts --no-interaction --locked 'example/*' | grep ^type | awk '{print \$3}'",
   ];
 
   /**
@@ -79,6 +85,35 @@ final class ComposerSimulatorContractTest extends UpdaterTestCase {
 
     self::assertSame($real, $this->lockedVersions());
     self::assertSame('1.3.0', $real['example/dependency']);
+  }
+
+  /**
+   * Tests a full resolution without installation locks the same versions.
+   */
+  public function testFullResolutionLocksTheSameVersionsWithoutInstalling(): void {
+    $command = 'composer update --no-plugins --no-scripts --no-interaction --no-install --no-progress';
+    $installed = file_get_contents($this->project()->path('vendor/composer/installed.json'));
+    $this->shell($command, $this->composerEnvironment());
+    $real = $this->lockedVersions();
+    self::assertSame($installed, file_get_contents($this->project()->path('vendor/composer/installed.json')));
+    $this->project()->git('checkout', 'composer.lock');
+    $this->shell($command, $this->simulatedEnvironment());
+    self::assertSame($real, $this->lockedVersions());
+    self::assertSame('1.1.0', $real['example/devtool']);
+  }
+
+  /**
+   * Tests the consumed self-version field agrees with the real Composer.
+   *
+   * Other self metadata is not consumed by the updater or simulated here.
+   */
+  public function testSelfVersionMatchesRealComposer(): void {
+    $command = 'composer show --no-plugins --no-scripts --no-interaction --self --format=json';
+    $real = explode("\n", $this->shell($command, $this->composerEnvironment()), 2);
+    $simulated = explode("\n", $this->shell($command, $this->simulatedEnvironment()), 2);
+    self::assertSame('[exit 0]', $real[0]);
+    self::assertSame($real[0], $simulated[0]);
+    self::assertSame(json_decode($real[1], TRUE)['versions'], json_decode($simulated[1], TRUE)['versions']);
   }
 
   /**
